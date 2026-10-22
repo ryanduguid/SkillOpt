@@ -2,7 +2,11 @@
 
 *Train agent skills like you train neural networks — with epochs, (mini-)batchsize, learning rates, and validation gates — but without touching model weights.*
 
+<div align="center">
+
 [![Project Page](https://img.shields.io/badge/Project%20Page-SkillOpt-8dbb3c?style=flat&labelColor=000000&color=66023C)](https://microsoft.github.io/SkillOpt/) [![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b?style=flat&labelColor=000000&color=66023C)](https://arxiv.org/abs/2605.23904) [![Project Video](https://img.shields.io/badge/Project%20Video-Watch%20Demo-ff0000?style=flat&labelColor=000000&color=66023C)](https://youtu.be/JUBMDTCiM0M) [![PyPI](https://img.shields.io/badge/PyPI-skillopt-green.svg?style=flat&labelColor=000000&color=66023C)](https://pypi.org/project/skillopt/) [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat&labelColor=000000&color=66023C)](https://www.python.org/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat&labelColor=000000&color=66023C)](LICENSE)
+
+</div>
 
 <p align="center">
   <a href="https://trendshift.io/repositories/38498?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-38498" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/dynamic/xml?url=https%3A%2F%2Ftrendshift.io%2Fapi%2Fbadge%2Frepositories%2F38498&query=%2F%2F*%5Blocal-name%28%29%3D%27foreignObject%27%5D%2F*%5Blocal-name%28%29%3D%27div%27%5D%5Bcontains%28.%2C+%27Repository+Of+The+Day%27%29%5D&label=GitHub+trending&style=flat&labelColor=000000&color=66023C" alt="microsoft%2FSkillOpt | Trendshift" height="20"/></a>
