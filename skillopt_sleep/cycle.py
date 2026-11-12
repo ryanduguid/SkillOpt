@@ -29,10 +29,9 @@ from skillopt_sleep.dream import dream_consolidate
 from skillopt_sleep.evidence import EvidenceLog
 from skillopt_sleep.handoff_backend import PendingCalls
 from skillopt_sleep.harvest import format_harvest_note
-from skillopt_sleep.harvest_sources import harvest_for_config
+from skillopt_sleep.harvest_sources import harvest_for_config, normalize_transcript_source
 from skillopt_sleep.memory import ensure_skill_scaffold
 from skillopt_sleep.mine import group_tasks_by_skill_hint, mine
-from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.multi_skill import (
     BUDGET_REACHED,
     SKIPPED,
@@ -42,6 +41,7 @@ from skillopt_sleep.multi_skill import (
     consolidate_groups,
     skill_group_reports,
 )
+from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.skill_resolver import resolve_skill, skill_search_roots
 from skillopt_sleep.staging import (
     SkillProposal,
@@ -177,6 +177,24 @@ def _make_backend_key(backend: Backend) -> str:
     name = str(getattr(backend, "name", backend.__class__.__name__) or "")
     model = str(getattr(backend, "model", "") or "")
     return f"{name}::{model}"
+
+
+def _claude_isolation_modes(backend: Backend, *, reset: bool = False) -> dict[str, list[str]]:
+    """Keep per-night mode evidence for direct and split-role backends."""
+    roles = {
+        "backend": backend,
+        "optimizer": getattr(backend, "optimizer", None),
+        "target": getattr(backend, "target", None),
+    }
+    modes = {}
+    for role, resolved in roles.items():
+        used = getattr(resolved, "isolation_modes_used", None)
+        if used is not None:
+            if reset:
+                used.clear()
+            elif used:
+                modes[role] = sorted(used)
+    return modes
 
 
 def _check_model_change(
@@ -326,6 +344,22 @@ def _report_score(value: object) -> str:
     return f"{score:.3f}" if math.isfinite(score) else "—"
 
 
+def _edit_sources_md(edit) -> str:
+    """Render structured evidence provenance without implying causal attribution."""
+    tasks = [str(value) for value in getattr(edit, "source_task_ids", []) if value]
+    sessions = [str(value) for value in getattr(edit, "source_session_ids", []) if value]
+    if not tasks and not sessions:
+        return ""
+    task_text = ", ".join(f"`{_markdown_text(value)}`" for value in tasks) or "—"
+    session_text = ", ".join(
+        f"`{_markdown_text(value)}`" for value in sessions
+    ) or "—"
+    return (
+        f"  \n  _source task IDs: {task_text}; "
+        f"source session IDs: {session_text}_"
+    )
+
+
 def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
     project = _markdown_text(report.project)
     backend = _markdown_text(cfg.get("backend"))
@@ -399,6 +433,12 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
                     f"| {candidate_score} | {status} |"
                 )
             lines.append("")
+    if any((report.edits, report.rejected_edits, report.unmatched_edits)):
+        lines.append(
+            "_Edit source IDs list the task evidence supplied to reflection; "
+            "they do not claim which task caused a particular edit._"
+        )
+        lines.append("")
     if report.edits:
         lines.append("## Accepted edits")
         for e in report.edits:
@@ -406,8 +446,9 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             op = _markdown_text(e.op)
             content = _markdown_text(e.content)
             rationale = _markdown_text(e.rationale)
+            sources = _edit_sources_md(e)
             lines.append(
-                f"- \\[{target}/{op}\\] {content}  \n  _why: {rationale}_"
+                f"- \\[{target}/{op}\\] {content}  \n  _why: {rationale}_{sources}"
             )
         lines.append("")
     if report.rejected_edits:
@@ -421,7 +462,9 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             target = _markdown_text(e.target)
             op = _markdown_text(e.op)
             content = _markdown_text(e.content)
-            lines.append(f"- \\[{target}/{op}\\] {content}")
+            lines.append(
+                f"- \\[{target}/{op}\\] {content}{_edit_sources_md(e)}"
+            )
         lines.append("")
     if report.unmatched_edits:
         lines.append("## Proposed but changed nothing (never reached the gate)")
@@ -433,12 +476,13 @@ def _render_report_md(report: SleepReport, cfg: SleepConfig) -> str:
             target = _markdown_text(e.target)
             op = _markdown_text(e.op)
             content = _markdown_text(e.content)
+            sources = _edit_sources_md(e)
             anchor = (
                 f"  \n  _anchor: `{_markdown_text(e.anchor)}`_"
                 if e.anchor
                 else ""
             )
-            lines.append(f"- \\[{target}/{op}\\] {content}{anchor}")
+            lines.append(f"- \\[{target}/{op}\\] {content}{anchor}{sources}")
         lines.append("")
     if report.skill_groups:
         # The reviewer decides per skill, so the per-skill verdicts belong on
@@ -676,6 +720,8 @@ def run_sleep_cycle(
         it can inspect the backend's pending calls after the run.
     """
     cfg = cfg or load_config()
+    # Checked before the night writes anything (state, staging dir, evidence).
+    harvest_source = normalize_transcript_source(cfg.get("transcript_source"))
     budget = _night_token_budget(cfg)
     state = SleepState.load(cfg.state_path)
     project = _project_paths(cfg)
@@ -697,6 +743,7 @@ def run_sleep_cycle(
         project_dir=project,
     )
     _check_model_change(cfg, state, backend)  # F16: warn if model changed between nights
+    _claude_isolation_modes(backend, reset=True)
     night = state.begin_night(clock)
     started = _now_iso(clock)
     backend.preferences = cfg.get("preferences", "")
@@ -791,7 +838,7 @@ def run_sleep_cycle(
     # ── 1+2. harvest + mine (unless seed_tasks injected) ─────────────────
     # The harvest cursor is per (project, source): each source reads its own
     # store, so one shared cursor would make a source skip its sessions (#312).
-    harvest_source = cfg.get("transcript_source", "")
+    # harvest_source is the canonical name harvest_for_config reads.
     digests: List[SessionDigest] = []
     if seed_tasks is not None:
         tasks = seed_tasks
@@ -815,7 +862,7 @@ def run_sleep_cycle(
             candidate_limit = max(max_tasks, max_tasks * 3)
         _progress(
             cfg,
-            f"harvest start: source={cfg.get('transcript_source')} max_sessions={max_sessions}",
+            f"harvest start: source={harvest_source} max_sessions={max_sessions}",
         )
         digests = harvest_for_config(
             cfg,
@@ -1073,6 +1120,11 @@ def run_sleep_cycle(
                 row.reason = str(redact_secrets(row.reason))
             report.skill_groups = group_rows
 
+    isolation_modes = _claude_isolation_modes(backend)
+    for role, modes in isolation_modes.items():
+        report.notes.append(
+            f"Claude replay isolation ({role}): " + ", ".join("--" + mode for mode in modes)
+        )
     report.tokens_used = backend.tokens_used()
     report.ended_at = _now_iso(clock)
     if budget_skipped:
@@ -1132,7 +1184,7 @@ def run_sleep_cycle(
             report_md=report_md,
             out_dir=staging_dir_pre,
             skill_proposals=skill_proposals,
-            skill_roots=skill_search_roots(cfg) if skill_proposals else (),
+            skill_roots=skill_search_roots(cfg),
         )
         if ev is not None:
             ev.log("stage", "staged", staging_dir=staging_dir,
@@ -1152,6 +1204,7 @@ def run_sleep_cycle(
                     json_safe({
                         "night": night,
                         "backend": cfg.get("backend"),
+                        "claude_isolation_modes": isolation_modes,
                         "opencode_tool_replay": (
                             cfg.get("opencode_tool_replay", False) is True
                         ),
@@ -1198,7 +1251,7 @@ def run_sleep_cycle(
         state.set_last_model_key(_make_backend_key(backend))  # F16: track resolved model
         # ── 6. adopt (opt-in) ────────────────────────────────────────────
         if cfg.get("auto_adopt") and result.accepted:
-            adopted_paths = adopt_staging(staging_dir)
+            adopted_paths = adopt_staging(staging_dir, cfg=cfg)
             adopted = bool(adopted_paths)
         state.save()
 

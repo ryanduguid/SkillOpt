@@ -788,6 +788,28 @@ class TestHarvest(unittest.TestCase):
 
         cursor_harvest.assert_not_called()
 
+    def test_harvest_for_config_rejects_unknown_source(self):
+        from skillopt_sleep.harvest_sources import SUPPORTED_SOURCES, harvest_for_config
+
+        cfg = load_config(transcript_source="unknown_engine", invoked_project="/repo/project")
+        with self.assertRaises(ValueError) as ctx:
+            harvest_for_config(cfg)
+
+        msg = str(ctx.exception)
+        self.assertIn("Unknown transcript source 'unknown_engine'", msg)
+        self.assertIn("Supported sources:", msg)
+        for expected in SUPPORTED_SOURCES:
+            self.assertIn(expected, msg)
+
+    def test_harvest_for_config_accepts_empty_and_case_insensitive_source(self):
+        from skillopt_sleep.harvest_sources import harvest_for_config
+
+        expected = [SessionDigest(session_id="claude-session", project="/repo/project")]
+        for s in ("", "claude", "CLAUDE", "Claude"):
+            cfg = load_config(transcript_source=s, invoked_project="/repo/project")
+            with mock.patch("skillopt_sleep.harvest_sources.harvest", return_value=expected):
+                self.assertEqual(harvest_for_config(cfg), expected)
+
     def test_harvest_codex_filters_project_and_cli_source(self):
         from skillopt_sleep.__main__ import _cfg_from_args
         from skillopt_sleep.harvest_sources import harvest_for_config
@@ -874,7 +896,10 @@ class TestHarvest(unittest.TestCase):
         report = SleepReport(
             night=1,
             project="/p",
-            edits=[EditRecord("skill", "add", "accepted rule")],
+            edits=[EditRecord(
+                "skill", "add", "accepted rule",
+                source_task_ids=["task-1"], source_session_ids=["session-1"],
+            )],
             rejected_edits=[EditRecord("skill", "add", "rejected rule")],
             skill_groups=[SkillGroupReport(
                 skill_name="research-skill",
@@ -889,6 +914,8 @@ class TestHarvest(unittest.TestCase):
 
         self.assertEqual(payload["n_accepted_edits"], 1)
         self.assertEqual(payload["n_rejected_edits"], 1)
+        self.assertEqual(payload["edits"][0]["source_task_ids"], ["task-1"])
+        self.assertEqual(payload["edits"][0]["source_session_ids"], ["session-1"])
         self.assertEqual(payload["rejected_edits"][0]["content"], "rejected rule")
         self.assertEqual(
             payload["skill_groups"][0]["skill_name"],
@@ -2267,6 +2294,33 @@ class TestFullCycleAndAdopt(unittest.TestCase):
                 run_sleep_cycle(cfg, seed_tasks=tasks)
 
 
+class TestGetBackend(unittest.TestCase):
+    """Validation and resolution tests for get_backend() and build_backend()."""
+
+    def test_mock_backend_default(self):
+        from skillopt_sleep.backend import MockBackend, get_backend
+        self.assertIsInstance(get_backend("mock"), MockBackend)
+        self.assertIsInstance(get_backend(""), MockBackend)
+        self.assertIsInstance(get_backend(None), MockBackend)
+        self.assertIsInstance(get_backend("  "), MockBackend)
+
+    def test_unknown_backend_raises_value_error(self):
+        from skillopt_sleep.backend import get_backend
+        with self.assertRaisesRegex(ValueError, "Unknown backend: 'unknown'"):
+            get_backend("unknown")
+        with self.assertRaisesRegex(ValueError, "Unknown backend: 'claud'"):
+            get_backend("claud")
+
+    def test_build_backend_rejects_unknown(self):
+        from skillopt_sleep.backend import build_backend
+        with self.assertRaisesRegex(ValueError, "Unknown backend: 'nonexistent'"):
+            build_backend(backend="nonexistent")
+        with self.assertRaisesRegex(ValueError, "Unknown backend: 'invalid_tgt'"):
+            build_backend(target_backend="invalid_tgt")
+        with self.assertRaisesRegex(ValueError, "Unknown backend: 'invalid_opt'"):
+            build_backend(optimizer_backend="invalid_opt")
+
+
 class TestCopilotBackend(unittest.TestCase):
     """Pure-logic tests for CopilotCliBackend — no `copilot` CLI required."""
 
@@ -2844,13 +2898,13 @@ class TestCursorBackend(unittest.TestCase):
 
 
 class TestClaudeCliBackendBare(unittest.TestCase):
-    """Issue #68: --bare must be conditional on ANTHROPIC_API_KEY."""
+    """Claude replays must fail closed when they cannot isolate user context."""
 
     def test_bare_included_when_api_key_set(self):
         """With ANTHROPIC_API_KEY, --bare should appear in the command."""
         from skillopt_sleep.backend import ClaudeCliBackend
         be = ClaudeCliBackend(claude_path="/usr/bin/false", timeout=5)
-        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             # We can't run the real CLI, but we can inspect cmd construction
             # by monkeypatching subprocess.run to capture the command.
             captured = {}
@@ -2865,24 +2919,57 @@ class TestClaudeCliBackendBare(unittest.TestCase):
                 be._call("test prompt")
             self.assertIn("--bare", captured["cmd"])
 
-    def test_bare_omitted_without_api_key(self):
-        """Without ANTHROPIC_API_KEY, --bare should NOT appear."""
+    def test_oauth_without_safe_mode_is_refused_before_replay(self):
+        """An unsupported CLI may be probed, but never run an unisolated replay."""
         from skillopt_sleep.backend import ClaudeCliBackend
+        from skillopt_sleep.staging import StagingError
         be = ClaudeCliBackend(claude_path="/usr/bin/false", timeout=5)
         env = os.environ.copy()
         env.pop("ANTHROPIC_API_KEY", None)
         with unittest.mock.patch.dict(os.environ, env, clear=True):
-            captured = {}
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                class FakeProc:
-                    stdout = "hello"
-                    stderr = ""
-                    returncode = 0
-                return FakeProc()
-            with unittest.mock.patch("subprocess.run", side_effect=fake_run):
-                be._call("test prompt")
-            self.assertNotIn("--bare", captured["cmd"])
+            with unittest.mock.patch("subprocess.run") as run:
+                run.return_value = mock.Mock(stdout="  --other  Option", returncode=0)
+                with self.assertRaisesRegex(StagingError, "user-level instructions and hooks"):
+                    be._call("test prompt")
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], [be.claude_path, "--help"])
+
+    def test_tool_aware_call_also_uses_bare_with_api_key(self):
+        """The tool-aware replay path must not reintroduce ambient hooks."""
+        from skillopt_sleep.backend import ClaudeCliBackend
+        from skillopt_sleep.types import TaskRecord
+        be = ClaudeCliBackend(claude_path="/usr/bin/false", timeout=5)
+        task = TaskRecord(id="t1", project="p", intent="test")
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            class FakeProc:
+                stdout = "hello"
+                stderr = ""
+                returncode = 0
+            return FakeProc()
+
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            with unittest.mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=fake_run):
+                be.attempt_with_tools(task, skill="", memory="", tools=["search"])
+        self.assertIn("--bare", captured["cmd"])
+
+    def test_tool_aware_oauth_call_is_refused_without_safe_mode(self):
+        from skillopt_sleep.backend import ClaudeCliBackend
+        from skillopt_sleep.staging import StagingError
+        from skillopt_sleep.types import TaskRecord
+        be = ClaudeCliBackend(claude_path="/usr/bin/false", timeout=5)
+        task = TaskRecord(id="t1", project="p", intent="test")
+        env = os.environ.copy()
+        env.pop("ANTHROPIC_API_KEY", None)
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            with unittest.mock.patch("skillopt_sleep.backend.subprocess.run") as run:
+                run.return_value = mock.Mock(stdout="  --other  Option", returncode=0)
+                with self.assertRaisesRegex(StagingError, "CLI advertising --safe-mode"):
+                    be.attempt_with_tools(task, skill="", memory="", tools=["search"])
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], [be.claude_path, "--help"])
 
     def test_cli_error_detected_and_logged(self):
         """Auth errors in CLI output should trigger a warning."""
@@ -2896,7 +2983,7 @@ class TestClaudeCliBackendBare(unittest.TestCase):
                 stderr = ""
                 returncode = 0
             return FakeProc()
-        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             with unittest.mock.patch("subprocess.run", side_effect=fake_run):
                 result = be._call("test prompt")
         # The error string is returned as output (backwards-compat)
@@ -2912,7 +2999,8 @@ class TestClaudeCliBackendBare(unittest.TestCase):
             claude_path="/nonexistent/claude-binary",
             timeout=3,
         )
-        result = be._call("test prompt")
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            result = be._call("test prompt")
         self.assertEqual(result, "")
         self.assertIn("Claude CLI spawn failed", be.last_call_error)
 
@@ -2930,7 +3018,8 @@ class TestClaudeCliBackendBare(unittest.TestCase):
             reference="ref", reference_kind="exact",
             tags=[], split="train",
         )
-        resp, called = be.attempt_with_tools(task, "", "", tools=["search"])
+        with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+            resp, called = be.attempt_with_tools(task, "", "", tools=["search"])
         self.assertEqual(resp, "")
         self.assertIn("Claude CLI spawn failed", be.last_call_error)
 

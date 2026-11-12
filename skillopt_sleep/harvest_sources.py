@@ -12,6 +12,42 @@ from skillopt_sleep.harvest_opencode import harvest_opencode
 from skillopt_sleep.harvest_pi import harvest_pi
 from skillopt_sleep.types import SessionDigest
 
+SUPPORTED_SOURCES = (
+    "claude",
+    "codex",
+    "copilot",
+    "copilot_cli",
+    "cursor",
+    "pi",
+    "opencode",
+    "auto",
+)
+
+
+def normalize_transcript_source(value: object) -> str:
+    """Canonical name of a configured ``transcript_source``.
+
+    Unset or empty means ``claude``; otherwise case and surrounding
+    whitespace are ignored. The harvester, its per-source cursor and the
+    tasks document must all use this one value: a cursor keyed by the raw
+    spelling (``<project>::Codex``) is not the one the harvested source
+    owns, and skips its older sessions (#312).
+    """
+    supported = ", ".join(SUPPORTED_SOURCES)
+    if value is None:
+        return "claude"
+    if not isinstance(value, str):
+        raise ValueError(
+            f"transcript_source must be a string, not {type(value).__name__} "
+            f"{value!r}. Supported sources: {supported}"
+        )
+    source = (value or "claude").strip().lower()
+    if source not in SUPPORTED_SOURCES:
+        raise ValueError(
+            f"Unknown transcript source '{value}'. Supported sources: {supported}"
+        )
+    return source
+
 
 def harvest_for_config(
     cfg,
@@ -26,7 +62,7 @@ def harvest_for_config(
     `skillopt_sleep.harvest.harvest`); the other sources have no repeat
     filter to report yet and leave it untouched.
     """
-    source = cfg.get("transcript_source", "claude")
+    source = normalize_transcript_source(cfg.get("transcript_source", "claude"))
     scope = cfg.get("projects", "invoked")
     invoked_project = cfg.get("invoked_project", "")
 

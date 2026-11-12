@@ -21,6 +21,7 @@ consolidation stage gates and stages.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -139,6 +140,8 @@ def _optimizer_feedback(task: TaskRecord, result: ReplayResult) -> str:
             task.judge,
             getattr(result, "response", ""),
             getattr(result, "tools_called", []),
+            # Replay measured tool calls for every tool task.
+            verified_tools=True,
         )
         return feedback
     feedback = getattr(result, "optimizer_feedback", "")
@@ -514,11 +517,19 @@ class CliBackend(Backend):
         raw = self._cached_call(key, prompt, max_tokens=200)
         obj = _extract_json(raw, "object")
         if isinstance(obj, dict):
+            raw_score = obj.get("score", 0.0)
             try:
-                soft = float(obj.get("score", 0.0))
-                return (1.0 if soft >= 0.8 else 0.0), soft, str(obj.get("reason", ""))[:200]
+                soft = float(raw_score)
             except (ValueError, TypeError):
-                pass
+                soft = None
+            # The judge prompt asks for a 0..1 score. json.loads accepts NaN and
+            # Infinity, and a model may answer on another scale (0-10, percent).
+            # Clamping would turn "8/10" into a perfect 1.0, so fail closed and
+            # name the problem instead of letting it move the gate.
+            if soft is not None and not isinstance(raw_score, bool):
+                if math.isfinite(soft) and 0.0 <= soft <= 1.0:
+                    return (1.0 if soft >= 0.8 else 0.0), soft, str(obj.get("reason", ""))[:200]
+                return 0.0, 0.0, f"judge-score-out-of-range: {str(raw_score)[:40]}"
         return 0.0, 0.0, "judge-parse-failed"
 
     def reflect(
@@ -802,6 +813,8 @@ class ClaudeCliBackend(CliBackend):
         # honors PATHEXT and returns the full claude.CMD path.
         import shutil as _shutil
         self.claude_path = _shutil.which(claude_path) or claude_path
+        self._safe_mode_supported: Optional[bool] = None
+        self.isolation_modes_used: set[str] = set()
 
     # Known CLI error prefixes that indicate auth or config failures.
     # When detected, we log a warning so the user doesn't mistake a
@@ -836,6 +849,37 @@ class ClaudeCliBackend(CliBackend):
                 self.last_call_error = combined[:500]
                 return
 
+    def _isolation_flag(self) -> str:
+        """Select an isolated mode; a failed capability probe never permits replay."""
+        if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+            mode = "bare"
+        else:
+            if self._safe_mode_supported is None:
+                self._safe_mode_supported = False
+                try:
+                    with tempfile.TemporaryDirectory(prefix="skillopt_claude_help_") as cwd:
+                        help_result = subprocess.run(
+                            [self.claude_path, "--help"], capture_output=True, text=True,
+                            creationflags=_NO_WINDOW, timeout=min(self.timeout, 10), cwd=cwd,
+                        )
+                    self._safe_mode_supported = help_result.returncode == 0 and bool(
+                        re.search(r"(?m)^\s*--safe-mode(?:\s|$)", help_result.stdout or "")
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if not self._safe_mode_supported:
+                from skillopt_sleep.staging import StagingError
+
+                raise StagingError(
+                    "Claude replay refused: isolated measurement requires ANTHROPIC_API_KEY "
+                    "for --bare or a CLI advertising --safe-mode. Without either, user-level "
+                    "instructions and hooks may contaminate scores. Upgrade Claude Code, "
+                    "configure an API key, or choose another backend."
+                )
+            mode = "safe-mode"
+        self.isolation_modes_used.add(mode)
+        return "--" + mode
+
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         # Run ISOLATED so the ambient Claude Code environment does not leak into
         # the optimizer/target call. Critically, the user's GLOBAL skills
@@ -843,16 +887,17 @@ class ClaudeCliBackend(CliBackend):
         # them explicitly — without this, reflect/attempt sometimes reply with a
         # list of the user's installed skills instead of doing the task.
         #   --bare                    skip hooks, LSP, plugins (minimal mode)
-        #                             Only safe with ANTHROPIC_API_KEY auth;
-        #                             breaks subscription-token auth (#68).
+        #                             Requires ANTHROPIC_API_KEY (#68).
+        #   --safe-mode               skip user customizations with normal auth;
+        #                             admin-managed policy still applies.
         #   --disable-slash-commands  disable all skills
         #   --disallowedTools '*'     no tool use
         #   --exclude-dynamic-...     drop per-machine cwd/env/memory/git sections
         #   cwd=<clean temp>          no project CLAUDE.md
         import tempfile
+        isolation_flag = self._isolation_flag()
         cmd = [self.claude_path, "-p", "--output-format", "text"]
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            cmd.append("--bare")
+        cmd.append(isolation_flag)
         cmd += [
             "--disable-slash-commands",
             "--disallowedTools", "*",
@@ -923,8 +968,7 @@ class ClaudeCliBackend(CliBackend):
                 "Return ONLY the final answer text."
             )
             cmd = [self.claude_path, "-p", "--output-format", "text"]
-            if os.environ.get("ANTHROPIC_API_KEY"):
-                cmd.append("--bare")
+            cmd.append(self._isolation_flag())
             cmd += [
                 "--disable-slash-commands",
                 "--allowedTools", "Bash",
@@ -2748,7 +2792,12 @@ def get_backend(
             project_dir or os.getcwd(), ".skillopt-sleep-handoff"
         )
         return HandoffBackend(model=model, handoff_dir=hdir)
-    return MockBackend()
+    if n in {"mock", ""}:
+        return MockBackend()
+    raise ValueError(
+        f"Unknown backend: {name!r}. Supported backends are: 'azure', 'azure-responses', "
+        "'claude', 'codex', 'copilot', 'cursor', 'handoff', 'mock', 'opencode', 'pi'."
+    )
 
 
 def build_backend(
