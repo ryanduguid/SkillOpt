@@ -18,7 +18,11 @@ All notable changes to SkillOpt are documented here. This project adheres to
   decisions and accepted edits are unchanged even when the token budget binds.
   A single-edit candidate needs no extra replay; an N-edit candidate costs up
   to N validation replays, which are included in `tokens used` and checked
-  against `max_tokens_per_night` one replay at a time. Follow-up to #174.
+  against `max_tokens_per_night` one replay at a time. An ablation replay that
+  fails leaves its rows `unmeasured` and is logged as an
+  `edit_ablation_failed` event instead of failing the night, and each ablation
+  event names its fan-out group (`skill`), `night` and `trial_index`.
+  Follow-up to #174.
 - **OfficeQA Parallel Search MCP** as an opt-in `env.search_mode=parallel`
   provider for `openai_chat`/`qwen_chat`. The default stays `offline` and no
   config selects Parallel automatically. Selecting it sends the generated
@@ -230,6 +234,17 @@ All notable changes to SkillOpt are documented here. This project adheres to
   instead of treating them as missing, and load integral floats such as
   `1776.0` as `1776`, so a correct integer answer is no longer scored wrong
   (thanks @Shizoqua).
+- Detect SkillOpt-Sleep refusals written with a typographic apostrophe, such as
+  `I can’t help with that.`, so the `no_refusal` rule check no longer gives a
+  bare refusal full credit (thanks @Shizoqua).
+- Ignore an `<answer>` opening tag mentioned in the reasoning before the real
+  answer in SearchQA, LiveMathematicianBench and OfficeQA, as DocVQA already
+  does, instead of scoring the text between them and marking a correct answer
+  wrong (thanks @Shizoqua).
+- Report hard selection accuracy in the run summary's `best_selection_hard`
+  and reused `final_selection_hard` instead of the gate-metric score, which
+  differs under the `soft` and `mixed` gate metrics or the semantic-density
+  bonus (thanks @Shizoqua).
 
 ### Security
 - Prevent managed-identity credentials from being sent to non-Azure or
@@ -247,6 +262,10 @@ All notable changes to SkillOpt are documented here. This project adheres to
 - Add focused coverage for the DocVQA ANLS evaluator, including the 0.5
   threshold boundary, the maximum over gold answers, and the accepted gold
   answer formats (thanks @Shizoqua).
+- Add focused coverage for LiveMathematicianBench choice shuffling: the
+  correct answer keeps its text after relabeling, evaluation batches are
+  deterministic for a seed, loaded items are not mutated, and an epoch covers
+  each training item once (thanks @Shizoqua).
 
 ### Acknowledgements 🙏
 Thank you to the contributors behind this unreleased work:
